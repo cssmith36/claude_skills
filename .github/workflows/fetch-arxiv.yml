@@ -1,0 +1,34 @@
+name: Fetch arXiv candidates
+on:
+  schedule:
+    - cron: '30 5 * * 1-5'  # 01:30 ET (= 05:30 UTC); routine fires at 02:00 ET.
+  workflow_dispatch:        # allow manual runs
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arxiv-digest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch
+        run: |
+          python3 .claude/skills/arxiv-nqs-digest/scripts/fetch_arxiv.py \
+            --state state/arxiv_seen.json \
+            > state/last_candidates.json
+      - name: Commit if changed
+        run: |
+          if [[ -z "$(git status --porcelain state/)" ]]; then
+            echo "No changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/arxiv_seen.json state/last_candidates.json
+          git commit -m "arxiv fetch $(date -u +%Y-%m-%d)"
+          git push
