@@ -41,14 +41,16 @@ User-specific calibration on top of the skill:
 Steps (run from the repo root):
 
 1. `cd arxiv-digest`
-2. Run the fetcher:
+2. **Idempotency check:** if `digests/$(date +%Y-%m-%d).md` already exists, exit immediately without fetching, committing, or pushing — today already ran.
+3. Run the fetcher **exactly once**:
    `python3 .claude/skills/arxiv-nqs-digest/scripts/fetch_arxiv.py --state state/arxiv_seen.json > /tmp/arxiv_today.json`
    stderr prints the candidate count; stdout is the JSON list. The script updates `state/arxiv_seen.json` in place (treats fetched papers as seen). Needs outbound network to `export.arxiv.org` / `arxiv.org`.
-3. Judge every candidate in /tmp/arxiv_today.json against the Interest Profile + the calibration above. Assign CORE, RELEVANT, or SKIP. Read the abstract, not just the title.
-4. Write the digest to `digests/<YYYY-MM-DD>.md` (use today's date in the routine's local timezone) in the skill's Output Format: CORE first, then "Also relevant", dropping SKIP. Each entry must have the author line (per the formatting rule above), primary_category, abs_url, and a 1–2 sentence "Why".
+   **Do NOT retry the fetcher on failure.** If stderr shows HTTP 429, 503, or "all query lanes failed", that means the shared cloud egress IP is rate-limited by arxiv. Retrying makes it worse and extends the cooldown. Skip straight to writing a one-line failure digest (`Fetch failed (<reason>) — tomorrow's 2-day lookback will recover today's papers.`), commit, push, and stop. Single fetch attempt only.
+4. Judge every candidate in /tmp/arxiv_today.json against the Interest Profile + the calibration above. Assign CORE, RELEVANT, or SKIP. Read the abstract, not just the title.
+5. Write the digest to `digests/<YYYY-MM-DD>.md` (use today's date in the routine's local timezone) in the skill's Output Format: CORE first, then "Also relevant", dropping SKIP. Each entry must have the author line (per the formatting rule above), primary_category, abs_url, and a 1–2 sentence "Why".
    - If nothing qualifies, write exactly one line: `No new relevant papers today (<YYYY-MM-DD>).` — this is the expected outcome on weekends/holidays.
    - Optional footer noting absences (e.g. "No NQS-methods papers today", "No Aharonov–Casher today") so the user knows the lack of CORE picks is the day's reality, not a filter miss.
-5. Commit and push:
+6. Commit and push:
    `git add state/arxiv_seen.json digests/<YYYY-MM-DD>.md`
    `git commit -m "arXiv digest <YYYY-MM-DD>"`
    `git push origin main`
