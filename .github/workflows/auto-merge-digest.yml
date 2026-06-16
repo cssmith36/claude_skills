@@ -1,17 +1,26 @@
-name: Auto-merge digest PRs
+name: Auto-merge digest branches
 on:
-  pull_request:
-    types: [opened, reopened, synchronize]
+  push:
+    branches:
+      - 'claude/**'
 permissions:
   contents: write
   pull-requests: write
 jobs:
-  automerge:
-    if: startsWith(github.head_ref, 'claude/')
+  open-and-merge:
     runs-on: ubuntu-latest
     steps:
-      - name: Merge immediately (squash, admin bypass)
-        run: gh pr merge --squash --delete-branch --admin "$PR"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Open PR and squash-merge
         env:
-          PR: ${{ github.event.pull_request.number }}
+          BRANCH: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR_URL=$(gh pr create --base main --head "$BRANCH" \
+            --title "$BRANCH" \
+            --body "Automated digest branch from Claude Code routine." 2>/dev/null || \
+            gh pr list --head "$BRANCH" --json url --jq '.[0].url')
+          gh pr merge --squash --delete-branch --admin "$PR_URL"
