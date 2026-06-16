@@ -119,7 +119,7 @@ Machine learning for quantum mechanics, plus methods/physics adjacent to the COR
 
 ## Core
 ### {Title}
-{Author1, Author2, et al.}  ·  {primary_category}  ·  {abs_url}
+{authors — see rule below}  ·  {primary_category}  ·  {abs_url}
 Why: {one or two sentences, grounded in the abstract, on why it matches —
 name the specific overlap, e.g. "real-space NQS for a magnetic-field problem".}
 
@@ -138,6 +138,7 @@ If there are no CORE or RELEVANT papers: output a single line —
   output for this run. Use its exact `title`, `authors`, `id`, and `abs_url`
   verbatim. If a paper is not in the JSON, it does not go in the digest.
 - **Do not rewrite titles or author names.** Copy them as given.
+- **Author list formatting:** if ≤4 authors, list them all. If >4, list the first two and the last two separated by an ellipsis: `First1, First2, …, Last2, Last1`. Never abbreviate to `et al.` — the user wants to see the senior author(s) at the end of the list.
 - **Keep "Why" grounded in the fetched abstract** — do not speculate about content
   the abstract does not state.
 - Quote at most a short phrase from any abstract; otherwise paraphrase.
