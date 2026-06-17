@@ -1,26 +1,27 @@
-name: Auto-merge digest branches
+name: Merge digest branches into main
 on:
   push:
     branches:
       - 'claude/**'
 permissions:
   contents: write
-  pull-requests: write
 jobs:
-  open-and-merge:
+  merge:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Open PR and squash-merge
+          ref: main
+      - name: Squash-merge branch into main
         env:
           BRANCH: ${{ github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          PR_URL=$(gh pr create --base main --head "$BRANCH" \
-            --title "$BRANCH" \
-            --body "Automated digest branch from Claude Code routine." 2>/dev/null || \
-            gh pr list --head "$BRANCH" --json url --jq '.[0].url')
-          gh pr merge --squash --delete-branch --admin "$PR_URL"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$BRANCH"
+          git merge --squash "origin/$BRANCH"
+          git commit -m "$BRANCH"
+          git push origin main
+          git push origin --delete "$BRANCH"
