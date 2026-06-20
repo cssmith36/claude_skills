@@ -1,7 +1,7 @@
 name: Fetch arXiv candidates
 on:
   schedule:
-    - cron: '17 2 * * 2-6'  # 22:17 ET prev day (= 02:17 UTC). Off-peak minute + large buffer before the 02:00 ET routine, because GitHub free-tier cron can be hours late at top-of-hour.
+    - cron: '17 18 * * 1-5'  # 14:17 ET (= 18:17 UTC) on weekdays. Mid-afternoon ET, ~12h before next morning's 02:00 ET routine. GitHub free-tier cron is consistently 4–5 hours late on lightly-used repos, so this buffer is necessary.
   workflow_dispatch:        # allow manual runs
 permissions:
   contents: write
