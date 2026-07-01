@@ -21,14 +21,11 @@ jobs:
           python3 .claude/skills/arxiv-nqs-digest/scripts/fetch_arxiv.py \
             --state state/arxiv_seen.json \
             > state/last_candidates.json
-      - name: Commit if changed
+          date -u +%Y-%m-%dT%H:%M:%SZ > state/last_fetch.txt
+      - name: Commit always
         run: |
-          if [[ -z "$(git status --porcelain state/)" ]]; then
-            echo "No changes."
-            exit 0
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state/arxiv_seen.json state/last_candidates.json
-          git commit -m "arxiv fetch $(date -u +%Y-%m-%d)"
+          git add state/arxiv_seen.json state/last_candidates.json state/last_fetch.txt
+          git commit -m "arxiv fetch $(date -u +%Y-%m-%d)" --allow-empty
           git push
