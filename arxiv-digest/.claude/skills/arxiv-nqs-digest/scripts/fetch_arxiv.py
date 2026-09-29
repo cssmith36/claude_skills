@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """Fetch recent arXiv papers for the daily NQS / ML-for-quantum digest.
 
-Pure standard library (urllib + xml.etree) so it runs in a routine
-environment with no pip installs. Hits the official arXiv API, applies a
-date window, drops papers already recorded in the state file, and prints
-the remaining candidates as JSON to stdout.
+Uses arXiv's RSS feeds (rss.arxiv.org) as the primary data source. The
+Atom API at export.arxiv.org is currently blocked from many cloud IPs
+(returns HTTP 406), whereas RSS is served from separate infrastructure
+that remains accessible. RSS gives us the same paper set (each category's
+newly-announced submissions for the day) with title, authors, abstract,
+categories, arXiv id, and pubDate.
 
-The relevance *judgement* is intentionally NOT done here -- that is the
-language model's job (see SKILL.md). This script only does the
-deterministic part: fetch + de-duplicate, so the model never has to
-invent or recall paper metadata.
+Pure standard library. Outputs the same JSON schema as the previous
+API-based fetcher, so downstream tooling (routine, digest format) does
+not need to change.
+
+Judgement (CORE / RELEVANT / SKIP) is intentionally NOT done here --
+that is the language model's job (see SKILL.md).
+
+Exit codes:
+    0 = success (may be zero candidates on a genuinely quiet day)
+    2 = fetch failure (too many category feeds unreachable) -- surfaced
+        so the workflow shows red instead of silently committing empty JSON.
 
 Usage:
     python fetch_arxiv.py --state /path/to/arxiv_seen.json
@@ -17,108 +26,167 @@ Usage:
 
 import argparse
 import datetime as dt
+import html
 import json
 import re
 import sys
 import time
-import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 
-API = "https://export.arxiv.org/api/query"
+RSS_BASE = "https://rss.arxiv.org/rss"
 
-NS = {
-    "atom": "http://www.w3.org/2005/Atom",
-    "arxiv": "http://arxiv.org/schemas/atom",
-}
-
-# Each lane is one arXiv `search_query`. Lane 1 pulls the NQS home
-# categories broadly; the others gate high-volume categories behind
-# keyword filters so the digest does not drown in unrelated ML / quant-ph.
-# Widen these if you find relevant papers are being missed.
-QUERIES = [
-    # Lane 1 -- NQS / correlated-electron home categories, pulled broadly.
-    "cat:cond-mat.str-el OR cat:cond-mat.dis-nn",
-
-    # Lane 2 -- broader categories gated behind ML / quantum-method keywords.
-    # supr-con included so NQS / ML-for-superconductivity papers are caught.
-    '(cat:quant-ph OR cat:physics.comp-ph OR cat:physics.chem-ph '
-    'OR cat:cond-mat.mes-hall OR cat:cond-mat.mtrl-sci OR cat:cond-mat.supr-con) AND '
-    '(abs:"neural network" OR abs:"machine learning" OR abs:"deep learning" '
-    'OR abs:"neural quantum state" OR abs:"variational Monte Carlo" '
-    'OR abs:"wave function" OR abs:"wavefunction" OR abs:"density functional")',
-
-    # Lane 3 -- ML categories, gated to a quantum / many-body context.
-    '(cat:cs.LG OR cat:stat.ML) AND '
-    '(abs:quantum OR abs:"many-body" OR abs:wavefunction '
-    'OR abs:"electronic structure" OR abs:Schrodinger OR abs:superconduct)',
-
-    # Lane 4 -- Wigner crystals & the 2D electron gas (physics, no ML gate).
-    '(cat:cond-mat.mes-hall OR cat:cond-mat.mtrl-sci OR cat:quant-ph) AND '
-    '(abs:"Wigner crystal" OR abs:"Wigner solid" OR abs:"electron crystal" '
-    'OR abs:"2D electron gas" OR abs:"two-dimensional electron gas" '
-    'OR abs:"artificial graphene")',
-
-    # Lane 5 -- quantum Hall / magnetic-field physics. Your active frontier:
-    # three in-progress NQS-in-field / quantum-Hall papers, so favour recall.
-    '(cat:cond-mat.mes-hall OR cat:quant-ph) AND '
-    '(abs:"fractional quantum Hall" OR abs:"quantum Hall" OR abs:"Landau level" '
-    'OR abs:"composite fermion")',
-
-    # Lane 6 -- moire / flat-band correlated systems & 2D superconductivity.
-    # Main volume driver; tighten these keywords if it floods the digest.
-    '(cat:cond-mat.mes-hall OR cat:cond-mat.mtrl-sci OR cat:cond-mat.supr-con) AND '
-    '(abs:moire OR abs:"twisted bilayer" OR abs:"twisted graphene" '
-    'OR abs:"flat band")',
+# Categories we pull. arXiv RSS is per-category; there is no server-side
+# keyword filter, so we keyword-gate high-volume categories client-side
+# in KEYWORD_GATE below.
+CATEGORIES = [
+    "cond-mat.str-el",
+    "cond-mat.dis-nn",
+    "cond-mat.mes-hall",
+    "cond-mat.mtrl-sci",
+    "cond-mat.supr-con",
+    "cond-mat.quant-gas",
+    "quant-ph",
+    "physics.chem-ph",
+    "hep-lat",
 ]
 
-MAX_PER_QUERY = 120
-REQUEST_DELAY = 3.0  # arXiv asks for ~3 s between successive calls
+# Categories that are high-volume with lots of unrelated content: require
+# at least one quantum/many-body/ML/NQS/moire keyword in the abstract.
+# Home categories (str-el, dis-nn, supr-con, quant-gas) are NOT gated;
+# everything announced there is a candidate.
+KEYWORD_GATE = {
+    "quant-ph",
+    "physics.chem-ph",
+    "hep-lat",
+    "cond-mat.mes-hall",
+    "cond-mat.mtrl-sci",
+}
+
+GATE_RE = re.compile(
+    r"\b("
+    r"neural[- ]network|neural quantum|NQS|variational Monte Carlo|VMC|"
+    r"FermiNet|PauliNet|PsiFormer|backflow|"
+    r"machine[- ]learning|deep learning|normalizing flow|"
+    r"wave[- ]?function|density functional|"
+    r"Wigner crystal|Wigner solid|electron crystal|"
+    r"2D electron gas|two-dimensional electron gas|artificial graphene|"
+    r"fractional quantum Hall|quantum Hall|Landau level|composite fermion|"
+    r"moire|moiré|twisted bilayer|twisted graphene|flat band|flat-band|"
+    r"Aharonov[- ]Casher|"
+    r"superconduct|Cooper pair|pairing"
+    r")\b",
+    re.I,
+)
+
+USER_AGENT = "arxiv-nqs-digest/2.0 (mailto:csmith4229@gmail.com)"
+REQUEST_DELAY = 1.5
+FEED_TIMEOUT = 30
+
+# If fewer than this many category feeds return successfully, treat the
+# whole run as a failure. RSS is normally very reliable; a large-scale
+# failure means arxiv or the runner has a problem worth investigating.
+MIN_FEEDS_OK = 5
 
 
-def short_id(entry_id: str) -> str:
-    """2406.01234v2 -> 2406.01234 ; hep-th/9901001v1 -> hep-th/9901001."""
-    raw = entry_id.split("/abs/")[-1]
-    return re.sub(r"v\d+$", "", raw)
+ITEM_RE = re.compile(r"<item\b[^>]*>(.*?)</item>", re.DOTALL)
+TAG_RES = {
+    "title": re.compile(r"<title[^>]*>(.*?)</title>", re.DOTALL),
+    "link": re.compile(r"<link[^>]*>(.*?)</link>", re.DOTALL),
+    "description": re.compile(r"<description[^>]*>(.*?)</description>", re.DOTALL),
+    "pubDate": re.compile(r"<pubDate[^>]*>(.*?)</pubDate>", re.DOTALL),
+    "creator": re.compile(r"<dc:creator[^>]*>(.*?)</dc:creator>", re.DOTALL),
+    "announce": re.compile(r"<arxiv:announce_type[^>]*>(.*?)</arxiv:announce_type>", re.DOTALL),
+}
+CATEGORY_RE = re.compile(r"<category[^>]*>([^<]+)</category>")
+ID_RE = re.compile(r"arxiv\.org/abs/([^\s<]+)")
 
 
-def parse_feed(xml_bytes: bytes) -> list:
-    root = ET.fromstring(xml_bytes)
+def strip_cdata(s: str) -> str:
+    s = s.strip()
+    if s.startswith("<![CDATA[") and s.endswith("]]>"):
+        s = s[9:-3]
+    return html.unescape(s.strip())
+
+
+def parse_pubdate(s: str) -> str:
+    """RFC-822 -> ISO 8601 (best effort)."""
+    if not s:
+        return ""
+    try:
+        d = dt.datetime.strptime(s.strip(), "%a, %d %b %Y %H:%M:%S %z")
+        return d.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    except ValueError:
+        return s.strip()
+
+
+def parse_feed(xml_text: str, feed_category: str) -> list:
     out = []
-    for e in root.findall("atom:entry", NS):
-        eid = e.findtext("atom:id", default="", namespaces=NS)
-        if not eid:
+    for m in ITEM_RE.finditer(xml_text):
+        item = m.group(1)
+
+        def field(name: str) -> str:
+            r = TAG_RES[name].search(item)
+            return strip_cdata(r.group(1)) if r else ""
+
+        link = field("link")
+        id_m = ID_RE.search(link)
+        if not id_m:
             continue
-        sid = short_id(eid)
-        primary = e.find("arxiv:primary_category", NS)
-        out.append({
-            "id": sid,
-            "title": " ".join((e.findtext("atom:title", "", NS) or "").split()),
-            "abstract": " ".join((e.findtext("atom:summary", "", NS) or "").split()),
-            "authors": [a.findtext("atom:name", "", NS)
-                        for a in e.findall("atom:author", NS)],
-            "primary_category": primary.get("term") if primary is not None else "",
-            "categories": [c.get("term") for c in e.findall("atom:category", NS)],
-            "published": e.findtext("atom:published", "", NS),
-            "abs_url": f"https://arxiv.org/abs/{sid}",
-            "pdf_url": f"https://arxiv.org/pdf/{sid}",
-        })
+        raw_id = id_m.group(1)
+        sid = re.sub(r"v\d+$", "", raw_id.split("/")[-1] if "/" in raw_id else raw_id)
+
+        desc = field("description")
+        # RSS description = "arXiv:2609.31831v1 Announce Type: new \nAbstract: ..."
+        # Strip the prefix so we're left with just the abstract.
+        abstract = desc
+        idx = abstract.find("Abstract:")
+        if idx >= 0:
+            abstract = abstract[idx + len("Abstract:") :].strip()
+        abstract = " ".join(abstract.split())
+
+        announce = field("announce").lower()
+        # Only take genuinely new submissions; drop replacements and
+        # cross-lists whose primary is elsewhere.
+        if announce and announce != "new":
+            continue
+
+        authors_raw = field("creator")
+        authors = [a.strip() for a in authors_raw.split(",") if a.strip()] if authors_raw else []
+
+        cats = [c.strip() for c in CATEGORY_RE.findall(item)]
+        primary = cats[0] if cats else feed_category
+
+        out.append(
+            {
+                "id": sid,
+                "title": " ".join(field("title").split()),
+                "abstract": abstract,
+                "authors": authors,
+                "primary_category": primary,
+                "categories": cats,
+                "published": parse_pubdate(field("pubDate")),
+                "abs_url": f"https://arxiv.org/abs/{sid}",
+                "pdf_url": f"https://arxiv.org/pdf/{sid}",
+                "_source_feed": feed_category,
+            }
+        )
     return out
 
 
-def fetch_query(query: str, max_results: int) -> list:
-    params = urllib.parse.urlencode({
-        "search_query": query,
-        "start": 0,
-        "max_results": max_results,
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    })
-    url = f"{API}?{params}"
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "arxiv-nqs-digest/1.0 (personal research digest)"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return parse_feed(resp.read())
+def fetch_feed(category: str) -> list:
+    url = f"{RSS_BASE}/{category}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=FEED_TIMEOUT) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    return parse_feed(body, category)
+
+
+def keyword_gated(paper: dict) -> bool:
+    """True if paper passes the keyword gate for its primary category."""
+    if paper["primary_category"] not in KEYWORD_GATE:
+        return True
+    text = f"{paper['title']} {paper['abstract']}"
+    return bool(GATE_RE.search(text))
 
 
 def load_state(path: str) -> set:
@@ -136,49 +204,58 @@ def save_state(path: str, ids: set) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--state", default="arxiv_seen.json",
-                    help="JSON file of already-considered arXiv ids")
-    ap.add_argument("--lookback-days", type=float, default=2.0)
+    ap.add_argument("--state", default="arxiv_seen.json")
     ap.add_argument("--no-commit", action="store_true",
                     help="do not add fetched ids to the state file")
     args = ap.parse_args()
 
     seen = load_state(args.state)
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=args.lookback_days)
 
     by_id: dict = {}
-    for i, q in enumerate(QUERIES):
+    feeds_ok = 0
+    for i, cat in enumerate(CATEGORIES):
         if i:
             time.sleep(REQUEST_DELAY)
         try:
-            for p in fetch_query(q, MAX_PER_QUERY):
+            for p in fetch_feed(cat):
+                # Prefer whichever feed first sees the paper -- doesn't matter
+                # because the same paper appears in multiple category feeds
+                # with identical content.
                 by_id.setdefault(p["id"], p)
-        except Exception as ex:  # one lane failing should not kill the run
-            print(f"warning: query lane {i} failed: {ex}", file=sys.stderr)
+            feeds_ok += 1
+        except Exception as ex:
+            print(f"warning: feed {cat} failed: {ex}", file=sys.stderr)
 
-    candidates = []
-    for p in by_id.values():
-        if p["id"] in seen:
-            continue
-        raw = (p["published"] or "").replace("Z", "+00:00")
-        try:
-            pub = dt.datetime.fromisoformat(raw)
-        except ValueError:
-            pub = cutoff  # unparseable date -> don't let it gate the paper out
-        if pub < cutoff:
-            continue
-        candidates.append(p)
+    if feeds_ok < MIN_FEEDS_OK:
+        print(
+            f"FATAL: only {feeds_ok}/{len(CATEGORIES)} feeds returned; "
+            f"threshold is {MIN_FEEDS_OK}. Not committing anything.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
+    candidates = [
+        p for p in by_id.values()
+        if p["id"] not in seen and keyword_gated(p)
+    ]
     candidates.sort(key=lambda p: p["published"], reverse=True)
+    for p in candidates:
+        p.pop("_source_feed", None)
+
     json.dump(candidates, sys.stdout, indent=2)
     sys.stdout.write("\n")
 
-    # "seen" means "already considered", not "already reported": commit every
-    # fetched candidate so tomorrow's run doesn't re-evaluate the same papers.
+    # Seen state records every paper we FETCHED (not just reported), so
+    # tomorrow's run doesn't re-consider today's papers regardless of
+    # whether the LLM chose to include them in the digest.
     if not args.no_commit:
-        save_state(args.state, seen | {p["id"] for p in candidates})
+        save_state(args.state, seen | set(by_id.keys()))
 
-    print(f"{len(candidates)} candidate papers", file=sys.stderr)
+    print(
+        f"{len(candidates)} candidate papers "
+        f"({len(by_id)} unique fetched from {feeds_ok}/{len(CATEGORIES)} feeds)",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":
